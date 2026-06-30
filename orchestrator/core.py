@@ -1,9 +1,11 @@
 """
 Orchestrator — the brain of the assistant.
 
-Conversational messages: load history, call Gemini with full context, and
-(concurrently) extract any action items the user mentioned. Persist both
-turns, store the extracted items, return the reply.
+Conversational messages: load history, then run a ReAct loop — call Gemini
+with the registered tools, execute any function calls it requests, feed the
+results back, and repeat until it produces a text answer. Concurrently (it
+only needs the raw message) extract any action items. Persist both turns,
+store the extracted items, return the reply.
 
 Commands (messages starting with '/'): handled directly, without the LLM, and
 kept out of the conversation history — they are control, not conversation.
@@ -13,7 +15,6 @@ kept out of the conversation history — they are control, not conversation.
 
 Future seams (not implemented):
   - Intent classification → act / ask / answer / stay-quiet
-  - Tool dispatch: self._tools registry, looked up by intent
   - Pending-approval flow: tool wants to act → insert into pending_approvals,
             ask user to confirm, resume on approval
 """
@@ -28,8 +29,12 @@ from google.genai import types
 from config import GEMINI_API_KEY, GEMINI_FAST_MODEL
 from db.conversations import get_recent, insert_turn
 from db.action_items import insert_item, get_open, mark_done
+from tools.tasks import TasksTool
 
 logger = logging.getLogger(__name__)
+
+# Cap on ReAct rounds, so a misbehaving model can't loop on tools forever.
+_MAX_TOOL_ROUNDS = 5
 
 # Structured-output schema for action-item extraction. Gemini is forced to
 # return JSON matching this shape, so no brittle text parsing is needed.
@@ -51,15 +56,58 @@ _EXTRACTION_SCHEMA = types.Schema(
     required=["items"],
 )
 
+_JSON_TYPE_TO_GEMINI = {
+    "object": types.Type.OBJECT,
+    "string": types.Type.STRING,
+    "integer": types.Type.INTEGER,
+    "number": types.Type.NUMBER,
+    "boolean": types.Type.BOOLEAN,
+    "array": types.Type.ARRAY,
+}
+
+
+def _to_gemini_schema(js: dict) -> types.Schema:
+    """Translate a provider-agnostic JSON-Schema object into a genai Schema."""
+    kwargs: dict = {}
+    if "type" in js:
+        kwargs["type"] = _JSON_TYPE_TO_GEMINI[js["type"]]
+    if "description" in js:
+        kwargs["description"] = js["description"]
+    if "enum" in js:
+        kwargs["enum"] = js["enum"]
+    if "nullable" in js:
+        kwargs["nullable"] = js["nullable"]
+    if "properties" in js:
+        kwargs["properties"] = {k: _to_gemini_schema(v) for k, v in js["properties"].items()}
+    if "required" in js:
+        kwargs["required"] = js["required"]
+    if "items" in js:
+        kwargs["items"] = _to_gemini_schema(js["items"])
+    return types.Schema(**kwargs)
+
 
 class Orchestrator:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
         self._client = genai.Client(api_key=GEMINI_API_KEY)
 
-        # Tool registry — plug Tool instances in here later.
-        # e.g. self._tools = {"gmail": GmailTool(), "news": NewsTool()}
-        self._tools: dict = {}
+        # Tool registry — only working tools are registered, so the model is
+        # never offered a capability that would just error. Keyed by tool.name,
+        # which is also the function-call name Gemini sends back.
+        self._tools: dict = {t.name: t for t in (TasksTool(db_path),)}
+        self._tool_decls = self._build_tool_declarations()
+
+    def _build_tool_declarations(self):
+        """One genai Tool wrapping a FunctionDeclaration per registered tool."""
+        decls = [
+            types.FunctionDeclaration(
+                name=tool.name,
+                description=tool.description,
+                parameters=_to_gemini_schema(tool.parameters) if tool.parameters else None,
+            )
+            for tool in self._tools.values()
+        ]
+        return [types.Tool(function_declarations=decls)] if decls else None
 
     async def handle(self, user_id: str, message: str) -> str:
         logger.info("Orchestrator handling message from %s", user_id)
@@ -74,11 +122,10 @@ class Orchestrator:
         # --- Seam: intent classification goes here ---
         # intent = self._classify(message)  # act / ask / answer / stay-quiet
 
-        # The reply and the action-item extraction are independent — the reply
-        # needs the history, the extraction only needs this message — so run
-        # them concurrently instead of paying for two serial round-trips.
+        # The reply (which may run a multi-round tool loop) and the action-item
+        # extraction are independent, so run them concurrently.
         reply, items = await asyncio.gather(
-            self._llm_reply(history, message),
+            self._llm_reply(user_id, history, message),
             self._extract_action_items(message),
         )
 
@@ -134,9 +181,9 @@ class Orchestrator:
             "/done <id> — mark a task complete"
         )
 
-    # --- LLM calls ------------------------------------------------------
+    # --- LLM: reply with a tool-use (ReAct) loop ------------------------
 
-    async def _llm_reply(self, history: list, message: str) -> str:
+    async def _llm_reply(self, user_id: str, history: list, message: str) -> str:
         contents = []
         for turn in history:
             # Gemini uses "model" where the DB stores "assistant"
@@ -144,17 +191,55 @@ class Orchestrator:
             contents.append(types.Content(role=role, parts=[types.Part(text=turn["content"])]))
         contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
 
-        response = await self._client.aio.models.generate_content(
-            model=GEMINI_FAST_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "You are a concise personal assistant. "
-                    "Reply helpfully and briefly."
-                ),
+        config = types.GenerateContentConfig(
+            system_instruction=(
+                "You are a concise personal assistant. Reply helpfully and "
+                "briefly. You can call tools to look things up (such as the "
+                "user's open tasks); use them when relevant instead of guessing."
             ),
+            tools=self._tool_decls,
+            # Manual function calling — we run the loop ourselves so we can
+            # inject user_id and handle tool errors.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
-        return response.text
+
+        response = None
+        for _ in range(_MAX_TOOL_ROUNDS):
+            response = await self._client.aio.models.generate_content(
+                model=GEMINI_FAST_MODEL, contents=contents, config=config
+            )
+            calls = response.function_calls or []
+            if not calls:
+                break
+
+            # Append the model's function-call turn, then one user turn holding
+            # a response part per call (mirrors the genai SDK's own AFC loop).
+            contents.append(response.candidates[0].content)
+            response_parts = [
+                types.Part.from_function_response(
+                    name=fc.name, response=await self._dispatch_tool(user_id, fc)
+                )
+                for fc in calls
+            ]
+            contents.append(types.Content(role="user", parts=response_parts))
+
+        return (response.text if response else None) or (
+            "Sorry, I couldn't complete that."
+        )
+
+    async def _dispatch_tool(self, user_id: str, fc) -> dict:
+        """Run the requested tool; return a {'result'|'error': ...} dict."""
+        tool = self._tools.get(fc.name)
+        if tool is None:
+            return {"error": f"unknown tool {fc.name}"}
+        try:
+            result = await tool.run(user_id=user_id, **dict(fc.args or {}))
+            return {"result": result}
+        except Exception:
+            logger.exception("Tool %s failed", fc.name)
+            return {"error": f"tool {fc.name} failed"}
+
+    # --- LLM: action-item extraction ------------------------------------
 
     async def _extract_action_items(self, message: str) -> list:
         """Best-effort: pull explicit tasks/reminders out of a user message.
