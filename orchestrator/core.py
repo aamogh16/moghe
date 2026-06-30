@@ -52,7 +52,7 @@ class Orchestrator:
             contents.append(types.Content(role=role, parts=[types.Part(text=turn["content"])]))
         contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
 
-        response = self._client.models.generate_content(
+        response = await self._client.aio.models.generate_content(
             model=GEMINI_FAST_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(

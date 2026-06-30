@@ -11,12 +11,12 @@ def get_recent(db_path: str, user_id: str, limit: int = 20) -> List[Dict[str, st
         rows = conn.execute(
             """
             SELECT role, content FROM (
-                SELECT role, content, ts
+                SELECT id, role, content, ts
                 FROM conversations
                 WHERE user_id = ?
-                ORDER BY ts DESC
+                ORDER BY ts DESC, id DESC
                 LIMIT ?
-            ) ORDER BY ts ASC
+            ) ORDER BY ts ASC, id ASC
             """,
             (user_id, limit),
         ).fetchall()
