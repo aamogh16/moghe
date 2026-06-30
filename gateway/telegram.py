@@ -6,6 +6,10 @@ Responsibilities:
   - Gate on ALLOWED_CHAT_ID (silently drop everything else)
   - Hand the text to the orchestrator
   - Send the orchestrator's reply back
+
+Commands (e.g. /tasks) are forwarded to the orchestrator like any other
+text — command semantics live in the orchestrator, not here, so a different
+Channel subclass gets them for free.
 """
 import logging
 from telegram import Update
@@ -22,8 +26,10 @@ class TelegramChannel(Channel):
         # orchestrator.handle(user_id, text) -> str
         self._orchestrator = orchestrator
         self._app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        # filters.TEXT matches commands too (they are text); the orchestrator
+        # decides what to do with a leading '/'.
         self._app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
+            MessageHandler(filters.TEXT, self._on_message)
         )
 
     async def send(self, chat_id: int | str, text: str) -> None:

@@ -1,7 +1,8 @@
 # moghe — Claude Code context
 
 Personal Telegram assistant powered by Google Gemini. Single-user, messaging-first.
-Built incrementally — Day 1 scaffold is the current state.
+Built incrementally — through Day 3: conversation memory and action-item tracking
+are live; tools and scheduler are still stubs.
 
 ## How to run
 
@@ -28,16 +29,25 @@ main.py
 | Layer | Files | State |
 |---|---|---|
 | Config | `config.py` | Done |
-| DB schema | `db/schema.sql`, `db/init_db.py` | Tables created; not yet read/written |
-| Gateway | `gateway/base.py`, `gateway/telegram.py` | Working |
-| Orchestrator | `orchestrator/core.py` | Single-turn Gemini call; seams commented |
+| DB schema | `db/schema.sql`, `db/init_db.py` | Tables created |
+| DB access | `db/conversations.py`, `db/action_items.py` | `conversations` + `action_items` read/written |
+| Gateway | `gateway/base.py`, `gateway/telegram.py` | Working; forwards commands to orchestrator |
+| Orchestrator | `orchestrator/core.py` | Memory + action-item extraction + `/`-commands |
 | Tools | `tools/base.py`, `tools/{gmail,news,watchlist}.py` | Stubs — `NotImplementedError` |
 | Scheduler | `scheduler/core.py` | Stub — `NotImplementedError` |
 
-### The one working end-to-end path (Day 1)
+### Working end-to-end paths
 
 ```
-Telegram message → auth gate → Orchestrator.handle() → Gemini API → reply
+# Conversation (with memory + action-item capture)
+Telegram message → auth gate → Orchestrator.handle()
+    ├── load last 20 turns from conversations
+    ├── gather( Gemini reply , Gemini action-item extraction )   # concurrent
+    ├── persist both turns; store extracted items
+    └── reply (+ "📝 Noted: …" when tasks were captured)
+
+# Command (no LLM, not recorded in history)
+Telegram "/tasks" or "/done <id>" → Orchestrator.handle() → direct DB read/write → reply
 ```
 
 ### Key seams (where future features plug in)
@@ -50,8 +60,10 @@ Telegram message → auth gate → Orchestrator.handle() → Gemini API → repl
 Register in `Orchestrator.__init__` under `self._tools`. The orchestrator will
 dispatch to them once tool-use/ReAct loop is wired (Day N).
 
-**Add memory** — `Orchestrator.handle()` has commented blocks marking exactly where
-to read recent rows from `conversations` and write both turns back.
+**Add commands** — any message starting with `/` is routed by
+`Orchestrator._handle_command()` (no LLM, not stored in history). Add a branch
+there and a `_cmd_*` helper. The gateway forwards commands like any other text,
+so new channels inherit them for free.
 
 **Add scheduling** — `scheduler/core.py::Scheduler` is stubbed. Wire it into `main.py`
 alongside `channel.run()` using `asyncio.gather`.
@@ -59,11 +71,12 @@ alongside `channel.run()` using `asyncio.gather`.
 **Add approvals** — `pending_approvals` table exists. Before any consequential tool
 action, insert a row and ask the user to confirm; resume on approval message.
 
-### Intended evolution (not yet built)
+### Intended evolution
 
-1. **Memory** — pass recent `conversations` rows as context to every Gemini call
-2. **Action items** — extract and store tasks; `/tasks` command to list them
-3. **Tool use loop** — Gemini native function calling; ReAct loop in `Orchestrator.handle()`
+1. ~~**Memory** — pass recent `conversations` rows as context to every Gemini call~~ ✅ Day 2
+2. ~~**Action items** — extract and store tasks; `/tasks` command to list them~~ ✅ Day 3
+   (`/done <id>` completes one; extraction runs concurrently with the reply on every turn)
+3. **Tool use loop** — Gemini native function calling; ReAct loop in `Orchestrator.handle()` ← next
 4. **Gmail connector** — OAuth + read/summarise unread
 5. **Scheduler** — morning digest: Gmail summary + news + open action items
 6. **Watchlist** — price/event alerts pushed proactively via `Channel.send()`
