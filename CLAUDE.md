@@ -1,8 +1,9 @@
 # moghe — Claude Code context
 
 Personal Telegram assistant powered by Google Gemini. Single-user, messaging-first.
-Built incrementally — through Day 3: conversation memory and action-item tracking
-are live; tools and scheduler are still stubs.
+Built incrementally — through Day 5. Live: conversation memory, action-item
+tracking, a Gemini tool-use loop, and a read-only Gmail connector (needs a
+one-time OAuth consent). News, watchlist, and the scheduler are still stubs.
 
 ## How to run
 
@@ -14,6 +15,19 @@ python main.py
 ```
 
 Required `.env` values: `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `ALLOWED_CHAT_ID`.
+
+### Optional: connect Gmail (read-only)
+
+Unlocks the `check_unread_email` tool. Skip it and everything else still runs.
+
+1. Google Cloud Console → enable the Gmail API → create an OAuth 2.0 **Desktop
+   app** client → download the client-secret JSON.
+2. Save it to `data/gmail_credentials.json` (or set `GMAIL_CREDENTIALS_PATH`).
+3. Authorize once, on a machine with a browser: `python -m tools.gmail`
+   — the token is cached at `data/gmail_token.json` and auto-refreshes.
+
+`data/` is git-ignored; the credential and token files are secrets. The tool
+registers itself only once the token exists (checked at startup).
 
 ## Architecture
 
@@ -33,8 +47,8 @@ main.py
 | DB access | `db/conversations.py`, `db/action_items.py` | `conversations` + `action_items` read/written |
 | Gateway | `gateway/base.py`, `gateway/telegram.py` | Working; forwards commands to orchestrator |
 | Orchestrator | `orchestrator/core.py` | Memory + extraction + `/`-commands + tool-use loop |
-| Tools | `tools/base.py`, `tools/tasks.py` | `TasksTool` live and registered |
-| Tools (stubs) | `tools/{gmail,news,watchlist}.py` | Stubs — `NotImplementedError`; not registered |
+| Tools | `tools/base.py`, `tools/tasks.py`, `tools/gmail.py` | `TasksTool` always; `GmailTool` once authorized |
+| Tools (stubs) | `tools/{news,watchlist}.py` | Stubs — `NotImplementedError`; not registered |
 | Scheduler | `scheduler/core.py` | Stub — `NotImplementedError` |
 
 ### Working end-to-end paths
@@ -91,8 +105,9 @@ action, insert a row and ask the user to confirm; resume on approval message.
    (`/done <id>` completes one; extraction runs concurrently with the reply on every turn)
 3. ~~**Tool use loop** — Gemini native function calling; ReAct loop in `Orchestrator.handle()`~~ ✅ Day 4
    (manual function calling, `_MAX_TOOL_ROUNDS` cap; `TasksTool` is the first registered tool)
-4. **Gmail connector** — OAuth + read/summarise unread ← next
-5. **Scheduler** — morning digest: Gmail summary + news + open action items
+4. ~~**Gmail connector** — OAuth + read/summarise unread~~ ✅ Day 5
+   (read-only `gmail.readonly`; `GmailTool` registers once authorized via `python -m tools.gmail`)
+5. **Scheduler** — morning digest: Gmail summary + news + open action items ← next
 6. **Watchlist** — price/event alerts pushed proactively via `Channel.send()`
 
 ## DB tables

@@ -30,6 +30,7 @@ from config import GEMINI_API_KEY, GEMINI_FAST_MODEL
 from db.conversations import get_recent, insert_turn
 from db.action_items import insert_item, get_open, mark_done
 from tools.tasks import TasksTool
+from tools.gmail import GmailTool, is_configured as gmail_configured
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,13 @@ class Orchestrator:
         # Tool registry — only working tools are registered, so the model is
         # never offered a capability that would just error. Keyed by tool.name,
         # which is also the function-call name Gemini sends back.
-        self._tools: dict = {t.name: t for t in (TasksTool(db_path),)}
+        tools = [TasksTool(db_path)]
+        if gmail_configured():
+            tools.append(GmailTool())
+            logger.info("Gmail tool registered")
+        else:
+            logger.info("Gmail not authorized — tool not registered (run: python -m tools.gmail)")
+        self._tools: dict = {t.name: t for t in tools}
         self._tool_decls = self._build_tool_declarations()
 
     def _build_tool_declarations(self):

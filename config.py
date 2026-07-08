@@ -22,3 +22,9 @@ GEMINI_STRONG_MODEL: str = os.getenv("GEMINI_STRONG_MODEL", "gemini-2.5-pro")
 
 # --- Paths ---
 DB_PATH: str = os.getenv("DB_PATH", "data/assistant.db")
+
+# --- Gmail (optional) ---
+# OAuth client-secret JSON downloaded from Google Cloud Console (Desktop app).
+GMAIL_CREDENTIALS_PATH: str = os.getenv("GMAIL_CREDENTIALS_PATH", "data/gmail_credentials.json")
+# Cached authorized token (written after the one-time consent flow).
+GMAIL_TOKEN_PATH: str = os.getenv("GMAIL_TOKEN_PATH", "data/gmail_token.json")
